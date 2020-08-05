@@ -1,8 +1,8 @@
-﻿using System;
-
-namespace Jure
+﻿namespace Jure
 {
-    // This code implements the remote capabilities for the famous Junkers Morse Key attached to a Serial port, pin6
+    // This code (Junkers remote, JURE) implements the remote capabilities for the famous Junkers Morse Key attached to a Serial port, pin6
+    // Pin6 is sampled by this program and the state information transferred to the instance of JURE running rig side where it replays the key strokes to
+    // Pin7 of a serial port which is attached via an optocoupler to the key input of the rig.
     // (c) 2020, Gottfried Rudorfer, OE3GRJ
     // This code is for use inside a project created with the Visual C# > Windows Desktop > Console Application template.
     // Replace the code in Program.cs with this code.
@@ -26,7 +26,7 @@ namespace Jure
     public struct msgHeader
     {
         public byte clientCounter; // a reference number created by the client (on the key side) stored in a byte (0..255)
-        public byte bitVector; // a bitVector of 8 bits showing the status of pin6 queried in the _waitTime interval (10 ms)
+        public byte bitVector; // a bitVector of 8 bits showing the status of pin6 queried in the _waitMilliSecs interval (10 ms)
         public byte serverCounter; // a reference number created by the server (on the rig side) stored in a byte (0..255)
     }
 
@@ -97,20 +97,20 @@ namespace Jure
     // the server part of the program, which will run on the rig side
     class Server
     {
-
         private static List<int> lPings = new List<int>();
         private static int oldAvg = 0;
         private static List<msgHeader> lMQ = new List<msgHeader>();
         private static List<msgHeader> lNQ = new List<msgHeader>();
         private static int avgPing = 0;
         private static SerialPort _serialPort = new SerialPort();
-        private static int waitMilliSecs = 10;
+        private static int _waitMilliSecs = 10;
         private static bool _continue = false;
         private static WaveOutEvent waveOut;
         private static long startTime;
         private static Dictionary<int, long> dServerTime = new Dictionary<int, long>();
         private static List<int> lCliNos = new List<int>();
         private static bool bStartAudio = false;
+        private static bool bDisableLogging = false;
 
         // function to store the last 10 roundtrip times and calculate an average ping value
         public static int checkPing(int iPing)
@@ -118,11 +118,10 @@ namespace Jure
             lPings.Add(iPing);
             if (lPings.Count > 10)
                 lPings.RemoveAt(0);
+
             int sum = 0;
             for (int i = 0; i < lPings.Count; i++)
-            {
                 sum += lPings[i];
-            }
 
             if (lPings.Count < 10)
                 return 0;
@@ -135,8 +134,7 @@ namespace Jure
             avgPing = avg;
 
             // print the ping value if it changes by 10%
-            if (Math.Abs(oldAvg - avg) / avg > 0.1)
-            {
+            if (Math.Abs(oldAvg - avg) / avg > 0.1) {
                 Console.Write(avg + " ms ");
                 oldAvg = avg;
             }
@@ -155,18 +153,16 @@ namespace Jure
 
             Console.WriteLine("\nAvailable IP address(es) for " + strHostName + ":");
             // Enumerate IP addresses
-            foreach (IPAddress ipaddress in iphostentry.AddressList)
-            {
+            foreach (IPAddress ipaddress in iphostentry.AddressList) {
                 Regex IP4Regex = new Regex(@"^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$");
-                if (IP4Regex.IsMatch(ipaddress.ToString()))
-                {
+                if (IP4Regex.IsMatch(ipaddress.ToString())) {
                     Console.WriteLine("   " + ipaddress);
                 }
             }
         }
 
         // we send the dit and dahs via the serial port, pin7 to the rig
-        // between the rig and the serial port there is an opto coppler to have galvanic separation of the serial port and the rig
+        // between the rig and the serial port there is an optocoupler to have galvanic separation of the serial port and the rig
         public static void SerialOut()
         {
             Console.WriteLine("Thread SerialOut");
@@ -174,6 +170,17 @@ namespace Jure
             bool bLastPin7 = false;
             bool bPin7 = false;
             bool bLast8AllZero = true;
+
+            long oldONmilliseconds = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
+            long oldOFFmilliseconds = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
+            mClust amClust = new mClust();
+            mClust offClust = new mClust();
+            bool bNewChar = true;
+            bool bNewSpace = false;
+            bool bCharOut = false;
+            double bestOn = 0;
+            double bestOff = 0;
+            List<char> mChar = new List<char>();
 
             while (_continue)
             {
@@ -189,9 +196,8 @@ namespace Jure
                     }
                 }
 
-                if (lNQ.Count == 0)
-                {
-                    Thread.Sleep(10);
+                if (lNQ.Count == 0) {
+                    Thread.Sleep(_waitMilliSecs);
                     continue;
                 }
 
@@ -199,51 +205,99 @@ namespace Jure
 
                 // we are delaying the replay to wipe out small delays on the network between key and rig
                 // in case that the bitVector is zero, and the queue is smaller than 5, we delay a bit
-                bLast8AllZero = lNQ[lNQ.Count - 1].bitVector > 0;
-                if (bLast8AllZero && lNQ.Count < 5)
-                {
-                    Thread.Sleep(10);
+                bLast8AllZero = lNQ[lNQ.Count - 1].bitVector == 0;
+                if (bLast8AllZero && lNQ.Count < 5) {
+                    Thread.Sleep(_waitMilliSecs*2);
                     continue;
                 }
 
-                //PortChat.Log2("Before 2" + lNQ.Count);
-
                 msgHeader aHs = lNQ[0];
-                //PortChat.Log2("S1: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " " + lNQ.Count);
 
                 // the bitVector contains 8 bits which we replay in this loop to the output pin, pin7
                 for (int i = 0; i < 8; i++)
                 {
                     bPin7 = (aHs.bitVector & (1 << i)) != 0;
 
-                    //Console.WriteLine(aHs.clientTimeStamp + " " + lNQ.Count + " " + bPin7 );
+                    long lMilliSecs = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
 
-                    if (!bLastPin7 && bPin7)
-                    {
+                    if (!bLastPin7 && bPin7) {
                         _serialPort.RtsEnable = true;
                         bLastPin7 = bPin7;
                         if (bStartAudio)
                             waveOut.Play();
-                    }
-                    else if (bLastPin7 && !bPin7)
-                    {
+
+                        bNewChar = true;
+                        bCharOut = false;
+                        bNewSpace = false;
+
+                        long deltaMs = lMilliSecs - oldOFFmilliseconds;
+                        // we store off durations for furhter cluster processing
+                        offClust.AddArr(deltaMs);
+                        bestOff = offClust.getBestThres();
+                        oldONmilliseconds = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
+
+                    } else if (bLastPin7 && !bPin7) {
                         if (bStartAudio)
                             waveOut.Stop();
                         _serialPort.RtsEnable = false;
+
+                        long deltaMs = lMilliSecs - oldONmilliseconds;
+                        amClust.AddArr(deltaMs);
+                        bestOn = amClust.getBestThres();
+                        if (bestOn > 0) {
+                            // we can now determine if this is a dit or dah
+                            char c;
+                            if (deltaMs <= bestOn)
+                                c = '.';
+                            else
+                                c = '-';
+
+                            mChar.Add(c);
+                            oldOFFmilliseconds = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
+                        }
+
                         bLastPin7 = bPin7;
                     }
 
-                    //PortChat.Log2("S2: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " " + i + " " + aHs.clientCounter + " " + bPin7 );
+                    if (!bPin7) {
+                        long now = lMilliSecs - oldOFFmilliseconds;
 
-                    Thread.Sleep(waitMilliSecs);
+                        if (!bNewSpace && bCharOut && (now > 4.2 * bestOn)) {
+                            //Console.WriteLine("    <space>");
+                            Console.Write(" ");
+                            bNewSpace = true;
+                        }
+                        // simple approach to detect if we it the character boundary
+                        if (bNewChar && (now > 2 * bestOn)) {
+                            if (mChar.Count > 0) {
+                                string sMchar = new string(mChar.ToArray());
+                                char fChar = '~';
+
+                                // lookup for the corresponding letter in the morse dict
+                                if (MorseAlphabet.morseDict.ContainsKey(sMchar)) {
+                                    fChar = MorseAlphabet.morseDict[sMchar];
+                                }
+                                Console.Write(fChar);
+
+                                mChar.Clear();
+                                oldONmilliseconds = now;
+                            }
+                            bNewChar = false;
+                            bCharOut = true;
+                        }
+                    }
+
+                    // we are shorting the standard delay to wipe out if the server queue gets too big
+                    if (bLast8AllZero && lNQ.Count > 10)
+                        Thread.Sleep(_waitMilliSecs/2);
+                    else
+                        Thread.Sleep(_waitMilliSecs);
 
                     /* Using Pin 5 = Ground and Pin 7 RTS out to generate +5, +-0 V output
                         * GR 2020-07-19 tested okay */
                 }
                 lock (lNQ)
-                {
                     lNQ.RemoveAt(0);
-                }
             }
             _serialPort.RtsEnable = false;
         }
@@ -262,10 +316,11 @@ namespace Jure
         }
 
         // this implements the server/rig part
-        public static void Run(string SERVER_IP, int PORT_NO, int iCom, WaveOutEvent wo, bool so)
+        public static void Run(string SERVER_IP, int PORT_NO, int iCom, WaveOutEvent wo, bool so, bool dl)
         {
             waveOut = wo;
             bStartAudio = so;
+            bDisableLogging = dl;
 
             List<msgHeader> lCliMsg = new List<msgHeader>();
 
@@ -301,18 +356,20 @@ namespace Jure
             {
                 try
                 {
+                    long lNowMs = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
+
                     //---read incoming stream--- which might contain multiple packets in one
                     int bytesRead = nwStream.Read(buffer, 0, client.ReceiveBufferSize);
 
                     Dictionary<int, msgHeader> dMH = new Dictionary<int, msgHeader>();
 
                     // the read data may contain multiple msgHeader elements, we process all of them in this loop
-                    for (int j = 0; j < bytesRead; j += 3)
-                    {
+                    for (int j = 0; j < bytesRead; j += 3) {
                         byte[] bufInstance = buffer.Skip(j).Take(3).ToArray();
                         msgHeader aH = (msgHeader)InterOp.ByteArrayToStruct(bufInstance, 0, typeof(msgHeader));
 
-                        PortChat.Log2("I: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " index unsorted=" + aH.clientCounter);
+                        if (!bDisableLogging)
+                            PortChat.Log2("I: " + Convert.ToInt32(lNowMs-startTime) + " index unsorted=" + aH.clientCounter);
 
                         dMH[aH.clientCounter] = aH;
                     }
@@ -328,7 +385,8 @@ namespace Jure
                             if ((firstindex < 0) || (firstindex > index))
                                 firstindex = index;
 
-                            PortChat.Log2("I: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " index=" + index + " firstindex=" + firstindex);
+                            if (!bDisableLogging)
+                                PortChat.Log2("I: " + Convert.ToInt32(lNowMs - startTime) + " index=" + index + " firstindex=" + firstindex);
 
                             index--;
                             if (index < 0)
@@ -337,39 +395,43 @@ namespace Jure
                     }
 
                     index = firstindex;
-                    PortChat.Log2("I: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " firstindex=" + firstindex);
+                    if (!bDisableLogging)
+                        PortChat.Log2("I: " + Convert.ToInt32(lNowMs - startTime) + " firstindex=" + firstindex);
 
                     // now process all all msgHeader elements stored in the dictionary dMH
                     do
                     {
                         msgHeader aH = dMH[index];
 
-                        long lNowMs = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
-                        PortChat.Log2("Server read: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " " +
+                        if (!bDisableLogging)
+                            PortChat.Log2("Server read: " + Convert.ToInt32(lNowMs - startTime) + " " +
                             bytesRead + " clientCounter=" + aH.clientCounter + " bitvector=" + Convert.ToString(aH.bitVector, 2).PadLeft(8, '0') +
-                            " serverCounter=" + aH.serverCounter);
+                            " serverCounter=" + aH.serverCounter + " lMQ=" + lMQ.Count() + " lNQ=" + lNQ.Count());
 
                         //Console.WriteLine(aH.clientTimeStamp + " " + aH.cwState);
 
                         // we sent to the client the serverCounter, which we now get back
                         // we can now calulate a roundtrip time seen on the server side
-                        if (dServerTime.ContainsKey(aH.serverCounter))
-                        {
+                        if (dServerTime.ContainsKey(aH.serverCounter)) {
                             //PortChat.Log2("Before 3" + aH.serverCounter);
 
                             long srvMs = dServerTime[aH.serverCounter];
                             int iPing = Convert.ToInt32(lNowMs - srvMs);
                             checkPing(iPing);
                             //Console.Write(iPing + "ms ");
-                            dServerTime.Remove(aH.serverCounter);
+                            lock(dServerTime)
+                                dServerTime.Remove(aH.serverCounter);
                         }
 
                         // add a new server reference number and store the milliseconds since epoch in the dictionary dServerTime
                         aH.serverCounter = Convert.ToByte(iSrvCounter);
-                        dServerTime[iSrvCounter] = lNowMs;
+                        lock(dServerTime)
+                            dServerTime[iSrvCounter] = lNowMs;
 
-                        PortChat.Log2("Server send: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " clientCounter=" +
-                            aH.clientCounter + " bitvector=" + Convert.ToString(aH.bitVector, 2).PadLeft(8, '0') + " serverCounter=" + aH.serverCounter);
+                        if (!bDisableLogging)
+                            PortChat.Log2("Server send: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " clientCounter=" +
+                            aH.clientCounter + " bitvector=" + Convert.ToString(aH.bitVector, 2).PadLeft(8, '0') + " serverCounter=" + aH.serverCounter +
+                            " lMQ=" + lMQ.Count() + " lNQ=" +lNQ.Count());
 
 
                         byte[] bytesToSend = InterOp.StructToByteArray(aH);
@@ -385,7 +447,10 @@ namespace Jure
                             index = 0;
                     } while (dMH.ContainsKey(index));
 
-                    Thread.Sleep(waitMilliSecs);
+                    int iWaitMs = _waitMilliSecs - Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - lNowMs);
+                    if (iWaitMs < 0)
+                        iWaitMs = 0;
+                    Thread.Sleep(iWaitMs);
 
                     if (iSrvCounter == 255)
                         iSrvCounter = 0;
@@ -405,7 +470,6 @@ namespace Jure
             serialThread.Join();
             _serialPort.Close();
         }
-
     }
 
     // Wave provide implementation from 
@@ -463,11 +527,11 @@ namespace Jure
         public override int Read(float[] buffer, int offset, int sampleCount)
         {
             int sampleRate = WaveFormat.SampleRate;
-            for (int n = 0; n < sampleCount; n++)
-            {
+            for (int n = 0; n < sampleCount; n++) {
                 buffer[n + offset] = (float)(Amplitude * Math.Sin((2 * Math.PI * sample * Frequency) / sampleRate));
                 sample++;
-                if (sample >= sampleRate) sample = 0;
+                if (sample >= sampleRate) 
+                    sample = 0;
             }
             return sampleCount;
         }
@@ -476,17 +540,16 @@ namespace Jure
     // dictinary defining some morse alphabet
     public class MorseAlphabet
     {
-        public static Dictionary<string, char> morseDict = new Dictionary<string, char>()
-    {
-       {".-", 'a'}, {"-...", 'b'}, {"-.-.", 'c'}, {"-..", 'd'}, {".", 'e'}, {"..-.", 'f'},
-       {"--.", 'g'}, {"....", 'h'}, {"..", 'i'}, {".---", 'j'}, {"-.-", 'k'}, {".-..", 'l'},
-       {"--", 'm'}, {"-.", 'n'}, {"---", 'o'}, {".--.", 'p'}, {"--.-", 'q'}, {".-.", 'r'},
-        {"...", 's'}, {"-", 't'}, {"..-", 'u'}, {"...-", 'v'}, {".--", 'w'}, {"-..-", 'x'},
-        {"-.--", 'y'}, {"--..", 'z'}, {"-----", '0'}, {".----", '1'}, {"..---", '2'}, {"...--", '3'},
-        {"....-", '4'}, {".....", '5'}, {"-....", '6'}, {"--...", '7'}, {"---..", '8'}, {"----.", '9'},
-        {"-...-", '='}, {".-.-.", '+'}, {".-.-.-", '.'}, {"-..-.", '/'}, {"..--..", '?'}, {"--..--", ','},
-        {"-....-", '-'}, {".-.-", 'ä'}, {"---.", 'ö'}, {"..--", 'ü'}, {"...--...", 'ß'}
-   };
+        public static Dictionary<string, char> morseDict = new Dictionary<string, char>() {
+               {".-", 'a'}, {"-...", 'b'}, {"-.-.", 'c'}, {"-..", 'd'}, {".", 'e'}, {"..-.", 'f'},
+               {"--.", 'g'}, {"....", 'h'}, {"..", 'i'}, {".---", 'j'}, {"-.-", 'k'}, {".-..", 'l'},
+               {"--", 'm'}, {"-.", 'n'}, {"---", 'o'}, {".--.", 'p'}, {"--.-", 'q'}, {".-.", 'r'},
+               {"...", 's'}, {"-", 't'}, {"..-", 'u'}, {"...-", 'v'}, {".--", 'w'}, {"-..-", 'x'},
+               {"-.--", 'y'}, {"--..", 'z'}, {"-----", '0'}, {".----", '1'}, {"..---", '2'}, {"...--", '3'},
+               {"....-", '4'}, {".....", '5'}, {"-....", '6'}, {"--...", '7'}, {"---..", '8'}, {"----.", '9'},
+               {"-...-", '='}, {".-.-.", '+'}, {".-.-.-", '.'}, {"-..-.", '/'}, {"..--..", '?'}, {"--..--", ','},
+               {"-....-", '-'}, {".-.-", 'ä'}, {"---.", 'ö'}, {"..--", 'ü'}, {"...--...", 'ß'}
+        };
     }
 
     // Simple emperical approach to distinguish dits from dahs, we use an array of the past 50 durations the key was on
@@ -498,7 +561,7 @@ namespace Jure
 
         public mClust()
         {
-
+            //
         }
 
         public void AddArr(long value)
@@ -506,8 +569,7 @@ namespace Jure
             // Implement a buffer of the last onArrSize elements
             if (onArr.Count < onArrSize)
                 onArr.Add(value);
-            else
-            {
+            else {
                 onArr.RemoveAt(0);
                 onArr.Add(value);
             }
@@ -546,13 +608,10 @@ namespace Jure
 
                 for (int j = 0; j < onArr.Count; j++)
                 {
-                    if (onArr[j] <= i)
-                    {
+                    if (onArr[j] <= i) {
                         shorts.Add(onArr[j]);
 
-                    }
-                    else
-                    {
+                    } else {
                         longs.Add(onArr[j]);
                     }
                 }
@@ -564,8 +623,7 @@ namespace Jure
                 double vl = Variance(longs.ToArray());
                 double totalv = vs + vl;
 
-                if (totalv < minvs)
-                {
+                if (totalv < minvs) {
                     minvs = totalv;
                     bestThres = i;
                 }
@@ -582,7 +640,7 @@ namespace Jure
     // the main starting point of JuRe as well as the implementation on the key side
     public class PortChat
     {
-        public const string _sVersion = "v2020.08.04.01";
+        public const string _sVersion = "v2020.08.05.01";
         private static bool _bHelp = false;
         static bool _continue;
         static SerialPort _serialPort;
@@ -603,11 +661,10 @@ namespace Jure
         private static FileStream _logStream = null;
         private static string _logFile;
         public static StreamWriter _logStrWr = null;
-        // The response from the remote device.  
-        private static String response = String.Empty;
         private static ManualResetEvent receiveDone = new ManualResetEvent(false);
         private static Dictionary<int, long> dCliTimeStamps = new Dictionary<int, long>();
         private static List<int> lSrvNos = new List<int>();
+        private static bool bDisableLogging = false;
 
         // init wave provider, we are using Sine Waves
         static void MyInitNAudio()
@@ -647,15 +704,13 @@ namespace Jure
         public static void Log(string logMessage)
         {
             string sMsg = String.Format("{0}: {1}\n", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), logMessage);
-            if (_logStream == null)
-            {
+            if (_logStream == null) {
                 _logStream = new FileStream(_logFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
             }
 
             UnicodeEncoding uniEncoding = new UnicodeEncoding();
 
-            lock (_logStream)
-            {
+            lock (_logStream) {
                 _logStream.Seek(0, SeekOrigin.End);
                 // _logStream.Lock(0, 1);
 
@@ -669,8 +724,7 @@ namespace Jure
         // file logging function, to have traceability of code execution
         public static void Log2(string logMessage)
         {
-            if (_logStrWr == null)
-            {
+            if (_logStrWr == null) {
                 _logStrWr = File.AppendText(_logFile);
             }
 
@@ -682,14 +736,11 @@ namespace Jure
         public static void Main(string[] args)
         {
             bool bStartAudio = false;
-            for (int i = 0; i < args.Length; i++)
-            {
-                if (args[i] == "-audiodevice")
-                {
+            for (int i = 0; i < args.Length; i++) {
+                if (args[i] == "-audiodevice") {
                     iAudioDevice = Convert.ToInt32(args[++i]);
                     bStartAudio = true;
-                }
-                else if (args[i] == "-freq")
+                } else if (args[i] == "-freq")
                     iFrequency = Convert.ToInt32(args[++i]);
                 else if (args[i] == "-com")
                     iCom = Convert.ToInt32(args[++i]);
@@ -703,22 +754,20 @@ namespace Jure
                     bSideSwiper = true;
                 else if (args[i] == "-port")
                     iPort = Convert.ToInt32(args[++i]);
-                else if (args[i] == "-version")
-                {
+                else if (args[i] == "-disablelogging")
+                    bDisableLogging = true;
+                else if (args[i] == "-version") {
                     System.Console.WriteLine(System.AppDomain.CurrentDomain.FriendlyName + " Version: " + _sVersion);
                     Environment.Exit(1);
-                }
-                else if (args[i] == "-help")
+                } else if (args[i] == "-help")
                     _bHelp = true;
-                else
-                {
+                else {
                     System.Console.WriteLine("Invalid arg \"" + args[i] + "\"");
                     Environment.Exit(1);
                 }
             }
 
-            if (args.Length == 0 || _bHelp)
-            {
+            if (args.Length == 0 || _bHelp) {
                 System.Console.WriteLine(System.AppDomain.CurrentDomain.FriendlyName + " Version: " + _sVersion);
                 printAudioDevices();
                 printComPortNames();
@@ -728,8 +777,7 @@ namespace Jure
                 System.Console.WriteLine("Addional options: " + System.AppDomain.CurrentDomain.FriendlyName + " -version ... display version information   -help ... display help information\n");
             }
 
-            if (_bHelp)
-            {
+            if (_bHelp) {
                 System.Console.WriteLine(System.AppDomain.CurrentDomain.FriendlyName + " is a tool which allows to run the Junkers Key over a TCP socket.");
                 System.Console.WriteLine("You need two windows x64 computers with Serial RS232 interfaces, as most modern computers are lacking this kind of interface,\n" +
                    "use a USB to Serial Adapter like the Digitus DA-70156 on each computer.\n" +
@@ -737,6 +785,7 @@ namespace Jure
                    "On the key side a different custom cable is needed to be able to connect the Junkers straight key\n\n" +
                    "Additional command line options: -key -sideswiper ...  also read beside pin6, pin8\n" + 
                    "\t on the rig side you may also add -audiodevice <device> if you want to hear a listening tone on the rig computer\n" +
+                   "\t -disablelogging ... disables logging to file for debugging\n" + 
                    "This application requires .NET Core Runtime 3.1, download available at https://dotnet.microsoft.com/download/dotnet-core/3.1" );
             }
 
@@ -746,8 +795,7 @@ namespace Jure
             Process myProcess = Process.GetCurrentProcess();
             myProcess.PriorityClass = ProcessPriorityClass.RealTime;
             myProcess.PriorityBoostEnabled = true;
-            if ((myProcess.PriorityClass != ProcessPriorityClass.RealTime) || (myProcess.PriorityBoostEnabled == false))
-            {
+            if ((myProcess.PriorityClass != ProcessPriorityClass.RealTime) || (myProcess.PriorityBoostEnabled == false)) {
                 Console.WriteLine("Cannot change priority to RealTime. Did you start me as Administrator?");
                 Environment.Exit(1);
             }
@@ -764,8 +812,7 @@ namespace Jure
             else
                 Console.WriteLine("Process is running at priority " + sPrio + ". This is the highest possible priority.");
 
-            if ((bRig && bKey) || (!bRig && !bKey))
-            {
+            if ((bRig && bKey) || (!bRig && !bKey)) {
                 System.Console.Write("You have to specify -rig or -key");
                 Environment.Exit(1);
             }
@@ -774,15 +821,14 @@ namespace Jure
             MyInitNAudio();
 
             // in case of the rig option, this will start the rig part
-            if (bRig)
-            {
+            if (bRig) {
 
                 _logFile = "log-" + DateTime.Now.ToString("yyyy-MM-dd") + "-Srv.txt";
 
                 startTime = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
                 Log2("Startup of Server");
 
-                Server.Run(sIP, iPort, iCom, waveOut, bStartAudio);
+                Server.Run(sIP, iPort, iCom, waveOut, bStartAudio, bDisableLogging);
                 Environment.Exit(0);
             }
 
@@ -813,16 +859,12 @@ namespace Jure
 
             Console.WriteLine("Type QUIT to exit");
 
-            while (_continue)
-            {
+            while (_continue) {
                 message = Console.ReadLine();
 
-                if (stringComparer.Equals("quit", message))
-                {
+                if (stringComparer.Equals("quit", message)) {
                     _continue = false;
-                }
-                else
-                {
+                } else {
                     // Read();
                 }
             }
@@ -870,8 +912,7 @@ namespace Jure
 
             // Log2("Client ReceiveCallback bytesRead=" + bytesRead);
 
-            if (bytesRead > 0)
-            {
+            if (bytesRead > 0) {
                 // There might be more data, so store the data received so far.  
                 // state.sb.Append(Encoding.ASCII.GetString(state.buffer, 0, bytesRead));
                 state.bReceived.Add(state.buffer.ToArray());
@@ -879,29 +920,28 @@ namespace Jure
                 // Get the rest of the data.  
                 client.BeginReceive(state.buffer, 0, StateObject.BufferSize, 0,
                     new AsyncCallback(ReceiveCallback), state);
-            }
-            else
-            {
+            } else {
                 // Signal that all bytes have been received.  
                 receiveDone.Set();
             }
 
-            if (state.bReceived.Count > 0)
-            {
-                for (int j = 0; j < state.bReceived.Count; j += 3)
-                {
+            if (state.bReceived.Count > 0) {
+                for (int j = 0; j < state.bReceived.Count; j += 3) {
                     byte[] bufInstance = state.bReceived[0];
                     msgHeader aHr = (msgHeader)InterOp.ByteArrayToStruct(bufInstance, 0, typeof(msgHeader));
 
-                    Log2("Client receive:" + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " c=" + aHr.clientCounter + " s=" + aHr.serverCounter + " bytesRead=" + bytesRead);
+                    if (!bDisableLogging) 
+                        Log2("Client receive: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " " + bytesRead + 
+                        " clientCounter=" + aHr.clientCounter + " bitVector=" + Convert.ToString(aHr.bitVector, 2).PadLeft(8, '0') + 
+                        " serverCounter=" + aHr.serverCounter + " lMQ=" + lMQ.Count() + " lNQ=" + lNQ.Count());
 
                     lSrvNos.Add(aHr.serverCounter);
 
-                    if (dCliTimeStamps.ContainsKey(aHr.clientCounter))
-                    {
+                    if (dCliTimeStamps.ContainsKey(aHr.clientCounter)) {
 
                         long ms = dCliTimeStamps[aHr.clientCounter];
-                        dCliTimeStamps.Remove(aHr.clientCounter);
+                        lock (dCliTimeStamps)
+                            dCliTimeStamps.Remove(aHr.clientCounter);
 
                         int iPing = Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - ms);
                         avgPing = Server.checkPing(iPing);
@@ -925,21 +965,22 @@ namespace Jure
                 long ms1 = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
 
                 // we take over the data to send from the list lMQ into our privat list lNQ
-                lock (lMQ)
-                {
+                lock (lMQ) {
                     lock (lNQ)
                         lNQ.AddRange(lMQ);
                     lMQ.Clear();
                 }
 
-                while (lNQ.Count > 0)
-                {
+                while (lNQ.Count > 0) {
                     msgHeader aHs = lNQ[0];
 
                     byte[] bytesToSend = InterOp.StructToByteArray(aHs);
                     lNQ.RemoveAt(0);
 
-                    Log2("Client send: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " " + bytesToSend.Length + " clientCounter=" + aHs.clientCounter + " bitVector=" + Convert.ToString(aHs.bitVector, 2).PadLeft(8, '0') + " serverCounter=" + aHs.serverCounter);
+                    if (!bDisableLogging) 
+                        Log2("Client send: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " " + bytesToSend.Length + 
+                        " clientCounter=" + aHs.clientCounter + " bitVector=" + Convert.ToString(aHs.bitVector, 2).PadLeft(8, '0') + 
+                        " serverCounter=" + aHs.serverCounter + " lMQ=" + lMQ.Count() + " lNQ=" + lNQ.Count());
                     nwStream.Write(bytesToSend, 0, bytesToSend.Length);
 
                     Receive(client.Client);
@@ -991,6 +1032,9 @@ namespace Jure
             int iScanCount = 0;
             int iClientCount = 0;
             byte bOnOffStates = 0;
+            bool bNewChar = true;
+            bool bNewSpace = false;
+            bool bCharOut = false;
 
             while (_continue)
             {
@@ -1010,19 +1054,21 @@ namespace Jure
                     long lMilliSecs = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
 
                     // when all bits of the byte are set, we send this over to the rig
-                    if (iScanCount == 7)
-                    {
+                    if (iScanCount == 7) {
 
                         // the implemented protocol uses one byte to store a reference created by the client
                         // in our case it has the size of a byte (0..255), the counter is reset to 0 when it hits the boundary
                         // with the client refrence (0..255) the epoch time in ms is kept in a dictinoary,
                         // the server will send the client reference unmodified back to the client, and the client can calculate a rounttrip time 
-                        if (dCliTimeStamps.ContainsKey(iClientCount))
-                        {
+                        
+                        if (dCliTimeStamps.ContainsKey(iClientCount)) {
                             Log2("Warning: Client time stamp not cleared=" + iClientCount);
-                            dCliTimeStamps.Remove(iClientCount);
+
+                            lock (dCliTimeStamps)
+                                dCliTimeStamps.Remove(iClientCount); 
                         }
-                        dCliTimeStamps.Add(iClientCount, lMilliSecs);
+                        lock (dCliTimeStamps)
+                            dCliTimeStamps.Add(iClientCount, lMilliSecs);
 
                         msgHeader mHs;
 
@@ -1031,8 +1077,8 @@ namespace Jure
                         // the client stores a list of reference numbers sent by the server
                         // when the client sends this back to the server, it removes it from the list as done
                         mHs.serverCounter = 0;
-                        if (lSrvNos.Count > 0)
-                        {
+
+                        if (lSrvNos.Count > 0) {
                             mHs.serverCounter = Convert.ToByte(lSrvNos[0]);
                             lSrvNos.RemoveAt(0);
                         }
@@ -1054,48 +1100,38 @@ namespace Jure
                         iScanCount++;
 
                     // capture the case where the last status of the key was up (0) and the new is down (1).
-                    if (pin6 && !pin6_last)
-                    {
+                    if (pin6 && !pin6_last) {
+
+                        // variables for morse code detection
+                        bNewChar = true;
+                        bCharOut = false;
+                        bNewSpace = false;
+                        
                         //start the listening tone
                         waveOut.Play();
                         long deltaMs = lMilliSecs - oldOFFmilliseconds;
-                        //Console.WriteLine(milliseconds + "-" + oldOFFmilliseconds);
-                        // Console.Write(deltaMs + " ");
 
                         // we store off durations for furhter cluster processing
                         offClust.AddArr(deltaMs);
 
                         // we devide the off cluster in two groups, by searching for the lowest variance
                         bestOff = offClust.getBestThres();
-                        if (bestOff > 0)
-                        {
-                            /*
-                            Console.WriteLine("\n" + deltaMs + ":" + bestOn);
-                            if (deltaMs > 2* bestOn * 0.8)
-                                Console.Write(" * "); // Buchstabengrenze
-                            else if (deltaMs > 3 * bestOn * 0.8) // ich mache mehr Pause --> Wortgrenze?
-                                Console.Write(" | ");
-                            */
-                        }
 
                         oldONmilliseconds = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
                     }
 
                     // now capture the case where the last status of the key was down (1) and the new is up (0).
-                    if (!pin6 && pin6_last)
-                    {
+                    if (!pin6 && pin6_last) {
                         // stop the listening tone
                         waveOut.Stop();
-                        long deltaMs = lMilliSecs - oldONmilliseconds;
-                        // Console.Write(deltaMs + " ");
 
+                        long deltaMs = lMilliSecs - oldONmilliseconds;
                         // add the on time to a cluster of on times
                         amClust.AddArr(deltaMs);
 
                         // devide into 2 clusters by minimizing the total variance of both clusters
                         bestOn = amClust.getBestThres();
-                        if (bestOn > 0)
-                        {
+                        if (bestOn > 0) {
                             // we can now determine if this is a dit or dah
                             char c;
                             if (deltaMs <= bestOn)
@@ -1104,52 +1140,47 @@ namespace Jure
                                 c = '-';
 
                             mChar.Add(c);
-                            //Console.Write(c);
                         }
 
                         oldOFFmilliseconds = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
                     }
 
-
-                    if (pin8 && !pin8_last)
-                    {
+                    if (pin8 && !pin8_last) {
                         // needs to be implemented, implement keyer functionality 
                     }
 
 
-                    if (!pin8 && pin8_last)
-                    {
+                    if (!pin8 && pin8_last) {
                         // needs to be implemented, implement keyer functionality 
                     }
 
                     pin6_last = pin6;
                     pin8_last = pin8;
 
-                    if (!pin6)
-                    {
-                        int wordm = 10;
-                        long now = lMilliSecs - oldONmilliseconds;
+                    if (!pin6) {
+                        long now = lMilliSecs - oldOFFmilliseconds;
 
-                        // simple approach to detect if we it the character boundary
-                        if ((now > 4 * bestOn) && (now < wordm * bestOn))
-                        {
-                            if (mChar.Count > 0)
-                            {
+                        // simple approach to detect a new word,  the multiplyer needs to be optimized
+                        if (!bNewSpace && bCharOut && (now > 4.2 * bestOn)) {
+                            Console.Write(" ");
+                            bNewSpace = true;
+                        }
+
+                        // simple approach to detect a character,  the multiplyer needs to be optimized
+                        if (bNewChar && (now > 2 * bestOn)) {
+                            if (mChar.Count > 0) {
                                 string sMchar = new string(mChar.ToArray());
-
-
                                 char fChar = '~';
-
-                                // lookup for the corresponding letter in the morse dict
                                 if (MorseAlphabet.morseDict.ContainsKey(sMchar))
-                                {
                                     fChar = MorseAlphabet.morseDict[sMchar];
-                                }
-
-                                Console.WriteLine(" " + fChar.ToString().ToUpper() + sMchar.PadLeft(6));
+                               
+                                Console.Write(fChar);
+                                
                                 mChar.Clear();
                                 oldONmilliseconds = now;
                             }
+                            bNewChar = false;
+                            bCharOut = true;
                         }
                     }
                     //Log2("R:" + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " " +pin6);
@@ -1160,6 +1191,5 @@ namespace Jure
                 Thread.Sleep(_waitMilliSecs);
             }
         }
-
     }
 }
