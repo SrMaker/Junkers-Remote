@@ -22,11 +22,12 @@
     using System.Linq;
 
     // we use a special data structure in the protocol sent between the key and the rig
+    [StructLayout(LayoutKind.Sequential, Pack = 1)] // we do not want to have bytes padded and size of structure increased
     public struct MsgHeader
     {
         public byte clientCounter; // a reference number created by the client (on the key side) stored in a byte (0..255)
-        public byte bitVector; // a bitVector of 8 bits showing the status of pin6 queried in the _waitMilliSecs interval (10 ms)
         public byte serverCounter; // a reference number created by the server (on the rig side) stored in a byte (0..255)
+        public short bitVector; // a bitVector of 16 bits showing the status of pin6 queried in the _waitMilliSecs interval (10 ms)
     }
 
     public class Jure
@@ -47,9 +48,9 @@
         protected static WaveOutEvent waveOut = new WaveOutEvent();
         protected static long startTime;
 
-        protected static bool bDisableLogging = false;
+        protected static bool bDisableLogging = true;
 
-        protected const string _sVersion = "v2020.08.10.01";
+        protected const string _sVersion = "v2020.08.31.01";
 
         protected static bool _bHelp = false;
         protected static int iAudioDevice = 0;
@@ -61,6 +62,9 @@
         protected static int iPort = 7373;
         protected static bool bSideSwiper = false;
         protected static bool bStartAudio = false;
+
+        protected static int iQueueSize = 6;
+        protected static int iSizeMh = Marshal.SizeOf(typeof(MsgHeader));
 
         public static void Main(string[] args)
         {
@@ -85,8 +89,8 @@
                     bSideSwiper = true;
                 else if (args[i] == "-port")
                     iPort = Convert.ToInt32(args[++i]);
-                else if (args[i] == "-disablelogging")
-                    bDisableLogging = true;
+                else if (args[i] == "-enablelogging")
+                    bDisableLogging = false;
                 else if (args[i] == "-version")
                 {
                     System.Console.WriteLine("{0} Version: {1}", System.AppDomain.CurrentDomain.FriendlyName, _sVersion);
@@ -110,6 +114,7 @@
                 System.Console.WriteLine("\nUsage on the rig side: {0} -rig -com <no> -ip <ip> -port <port>", System.AppDomain.CurrentDomain.FriendlyName);
                 System.Console.WriteLine("Usage on the key side: {0} -key -com <no> -audiodevice <no> -freq <freq> -ip <rig ip> -port <rig port> \n", System.AppDomain.CurrentDomain.FriendlyName);
                 System.Console.WriteLine("Addional options: {0} -version ... display version information   -help ... display help information\n", System.AppDomain.CurrentDomain.FriendlyName);
+                System.Console.WriteLine("Defaults: ip={0} port={1} freq={2} Hz\n", sIP, iPort, iFrequency);  
             }
 
             if (_bHelp)
@@ -121,7 +126,7 @@
                    "On the key side a different custom cable is needed to be able to connect the Junkers straight key\n\n" +
                    "Additional command line options: -key -sideswiper ...  also read beside pin6, pin8\n" +
                    "\t on the rig side you may also add -audiodevice <device> if you want to hear a listening tone on the rig computer\n" +
-                   "\t -disablelogging ... disables logging to file for debugging\n" +
+                   "\t -enablelogging ... enables extentsive logging to file in same dirctory as Jure for debugging\n" +
                    "This application requires .NET Core Runtime 3.1, download available at https://dotnet.microsoft.com/download/dotnet-core/3.1");
             }
 
@@ -162,29 +167,6 @@
             else {
                 System.Console.Write("You have to specify -rig or -key");
                 Environment.Exit(0);
-            }
-        }
-        
-        // tried file locked logging, however the it turned out that locking caused timing issues in the whole program
-        public static void Log(string logMessage)
-        {
-            string sMsg = String.Format("{0}: {1}\n", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), logMessage);
-            if (_logStream == null)
-            {
-                _logStream = new FileStream(_logFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
-            }
-
-            UnicodeEncoding uniEncoding = new UnicodeEncoding();
-
-            lock (_logStream)
-            {
-                _logStream.Seek(0, SeekOrigin.End);
-                // _logStream.Lock(0, 1);
-
-
-                _logStream.Write(uniEncoding.GetBytes(sMsg), 0, uniEncoding.GetByteCount(sMsg));
-                // _logStream.Unlock(0, 1);
-                _logStream.Flush();
             }
         }
 
@@ -326,7 +308,6 @@
 
             bool bLastPin7 = false;
             bool bPin7;
-            bool bLast8AllZero;
 
             while (_continue)
             {
@@ -345,18 +326,34 @@
                     continue;
                 }
 
+                if (lNQ.Count < iQueueSize - 2)
+                {
+                    System.Console.Write('*');
+                    Log2("lNQ queue too small, " + lNQ.Count);
+                }
+                else if (lNQ.Count > iQueueSize + 2)
+                {
+                    System.Console.Write('!');
+                    Log2("lNQ queue too large, " + lNQ.Count);
+                }
+                else if (lMQ.Count > 5)
+                {
+                    System.Console.Write('!');
+                    Log2("lMQ queue too large, " + lMQ.Count);
+                }
+
                 // we are delaying the replay to wipe out small delays on the network between key and rig
                 // in case that the bitVector is zero, and the queue is smaller than 5, we delay a bit
-                bLast8AllZero = lNQ[lNQ.Count - 1].bitVector == 0;
-                if (bLast8AllZero && lNQ.Count < 5) {
-                    Thread.Sleep(_waitMilliSecs); // we will wait here additional 10ms
-                    continue;
-                }
+                // bLast16AllZero = lNQ[lNQ.Count - 1].bitVector == 0;
+                // if (bLast16AllZero && lNQ.Count < iQueueSize) {
+                //    Thread.Sleep(_waitMilliSecs); // we will wait here additional 10ms
+                //    continue;
+                //}
 
                 MsgHeader aHs = lNQ[0];
 
-                // the bitVector contains 8 bits which we replay in this loop to the output pin, pin7
-                for (int i = 0; i < 8; i++)
+                // the bitVector contains 16 bits which we replay in this loop to the output pin, pin7
+                for (int i = 0; i < 16; i++)
                 {
                     bPin7 = (aHs.bitVector & (1 << i)) != 0;
 
@@ -377,16 +374,14 @@
                         Morse.ToOff();
 
                         bLastPin7 = bPin7;
-                    }
-
-                    if (!bPin7) 
+                    } else if (!bPin7) 
                         Morse.IsOff();
 
-                    // we are shorting the standard delay to wipe out if the server queue gets too big
-                    if (bLast8AllZero && lNQ.Count > 10)
-                        Thread.Sleep(_waitMilliSecs/2);
-                    else
-                        Thread.Sleep(_waitMilliSecs);
+                    //int iWait = _waitMilliSecs - Math.Max(0, lNQ.Count - iQueueSize);
+                    int iWait = _waitMilliSecs - (lNQ.Count - iQueueSize); // if queue is too small add ms, if queue is too big remove ms
+
+                    if (iWait >0)
+                        Thread.Sleep(iWait);
 
                     /* Using Pin 5 = Ground and Pin 7 RTS out to generate +5, +-0 V output
                         * GR 2020-07-19 tested okay */
@@ -400,12 +395,8 @@
         // we do not directly send to the serial port, instead we queue it in list lMQ
         public static bool SerialSend(MsgHeader msg)
         {
-            int iNQel = lNQ.Count;
-            if (iNQel > 10000)
-                return false;
-            else
-                lock (lMQ)
-                    lMQ.Add(msg);
+            lock (lMQ)
+              lMQ.Add(msg);
 
             return true;
         }
@@ -457,12 +448,13 @@
                     Dictionary<int, MsgHeader> dMH = new Dictionary<int, MsgHeader>();
 
                     // the read data may contain multiple msgHeader elements, we process all of them in this loop
-                    for (int j = 0; j < bytesRead; j += 3) {
-                        byte[] bufInstance = buffer.Skip(j).Take(3).ToArray();
+                    for (int j = 0; j < bytesRead; j += iSizeMh)
+                    {
+                        byte[] bufInstance = buffer.Skip(j).Take(iSizeMh).ToArray();
                         MsgHeader aH = (MsgHeader)InterOp.ByteArrayToStruct(bufInstance, 0, typeof(MsgHeader));
 
                         if (!bDisableLogging)
-                            Log2("I: " + Convert.ToInt32(lNowMs-startTime) + " index unsorted=" + aH.clientCounter);
+                            Log2("I: " + Convert.ToInt32(lNowMs - startTime) + " index unsorted=" + aH.clientCounter);
 
                         dMH[aH.clientCounter] = aH;
                     }
@@ -491,7 +483,7 @@
                     if (!bDisableLogging)
                         Log2("I: " + Convert.ToInt32(lNowMs - startTime) + " firstindex=" + firstindex);
 
-                    if (index <0) // Client disconnected 
+                    if (index < 0) // Client disconnected 
                     {
                         string sMsg = "Client disconnected.";
                         Console.WriteLine("\n{0}", sMsg);
@@ -506,55 +498,70 @@
                     while (dMH.ContainsKey(index))
                     {
                         MsgHeader aH = dMH[index];
+                        int clientCounter = (int)aH.clientCounter;
+                        int serverCounter = (int)aH.serverCounter;
 
                         if (!bDisableLogging)
                             Log2("Server read: " + Convert.ToInt32(lNowMs - startTime) + " " +
-                            bytesRead + " clientCounter=" + aH.clientCounter + " bitvector=" + Convert.ToString(aH.bitVector, 2).PadLeft(8, '0') +
-                            " serverCounter=" + aH.serverCounter + " lMQ=" + lMQ.Count() + " lNQ=" + lNQ.Count());
+                            bytesRead + " clientCounter=" + clientCounter + " bitvector=" + Convert.ToString(aH.bitVector, 2).PadLeft(16, '0') +
+                            " serverCounter=" + serverCounter + " lMQ=" + lMQ.Count() + " lNQ=" + lNQ.Count());
 
                         // we sent to the client the serverCounter, which we now get back
                         // we can now calulate a roundtrip time seen on the server side
-                        if (dServerTime.ContainsKey(aH.serverCounter)) {
+                        if (dServerTime.ContainsKey(serverCounter))
+                        {
 
-                            long srvMs = dServerTime[aH.serverCounter];
+                            long srvMs = dServerTime[serverCounter];
                             int iPing = Convert.ToInt32(lNowMs - srvMs);
                             CheckPing(iPing);
-                            lock(dServerTime)
-                                dServerTime.Remove(aH.serverCounter);
+                            lock (dServerTime)
+                                dServerTime.Remove(serverCounter);
                         }
+
+                        // we add the data to be send to the serial port to the queue
+                        SerialSend(aH);
 
                         // add a new server reference number and store the milliseconds since epoch in the dictionary dServerTime
                         aH.serverCounter = Convert.ToByte(iSrvCounter);
-                        lock(dServerTime)
+
+                        if (lNQ.Count < iQueueSize - 2)
+                        {
+                            aH.bitVector = 2; // send queue too small
+                        }
+                        else if (lNQ.Count > iQueueSize + 2)
+                        {
+                            aH.bitVector = 3; // send queue too big
+                        }
+                        else
+                            aH.bitVector = 1;
+
+                        lock (dServerTime)
                             dServerTime[iSrvCounter] = lNowMs;
 
                         if (!bDisableLogging)
-                            Log2("Server send: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " clientCounter=" +
-                            aH.clientCounter + " bitvector=" + Convert.ToString(aH.bitVector, 2).PadLeft(8, '0') + " serverCounter=" + aH.serverCounter +
-                            " lMQ=" + lMQ.Count() + " lNQ=" +lNQ.Count());
-
+                            Log2("Server send: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) +
+                                " clientCounter=" + clientCounter + " bitvector=" + Convert.ToString(aH.bitVector, 2).PadLeft(16, '0') +
+                                " serverCounter=" + serverCounter + " lMQ=" + lMQ.Count() + " lNQ=" + lNQ.Count());
 
                         byte[] bytesToSend = InterOp.StructToByteArray(aH);
                         //---write back the text to the client---
                         nwStream.Write(bytesToSend, 0, bytesToSend.Length);
 
-                        // we add the data to be send to the serial prot to the queue
-                        SerialSend(aH);
+                        if (iSrvCounter == 255)
+                            iSrvCounter = 0;
+                        else
+                            iSrvCounter++;
 
                         index++;
                         if (index > 255)
                             index = 0;
-                    } 
+                    }
 
                     int iWaitMs = _waitMilliSecs - Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - lNowMs);
                     if (iWaitMs < 0)
                         iWaitMs = 0;
                     Thread.Sleep(iWaitMs);
 
-                    if (iSrvCounter == 255)
-                        iSrvCounter = 0;
-                    else
-                        iSrvCounter++;
                 }
                 catch (Exception e)
                 {
@@ -642,13 +649,13 @@
 
             long now = lMilliSecs - oldOFFmilliseconds;
 
-            if (!bNewSpace && bCharOut && (now > 4.2 * bestOn))
+            if (!bNewSpace && bCharOut && (now > 3.5 * bestOn))
             {
                 Console.Write(" ");
                 bNewSpace = true;
             }
             // simple approach to detect if we it the character boundary
-            if (bNewChar && (now > 1.5 * bestOn))
+            if (bNewChar && (now > 1.3 * bestOn))
             {
                 if (mChar.Count > 0)
                 {
@@ -754,7 +761,6 @@
     public class Key : Jure
     {
 
-        private static readonly ManualResetEvent receiveDone = new ManualResetEvent(false);
         private static readonly Dictionary<int, long> dCliTimeStamps = new Dictionary<int, long>();
         private static readonly List<int> lSrvNos = new List<int>();
 
@@ -802,86 +808,7 @@
             waveOut = null;
         }
 
-        // State object for reading client data asynchronously  
-        public class StateObject
-        {
-            // Client  socket.  
-            public Socket workSocket = null;
-            // Size of receive buffer.  
-            public const int BufferSize = 3;
-            // Receive buffer.  
-            public byte[] buffer = new byte[BufferSize];
-            // Receiving buffer
-            public List<byte[]> bReceived = new List<byte[]>();
-        }
 
-        private static void Receive(Socket client)
-        {
-            // Create the state object.  
-            StateObject state = new StateObject
-            {
-                workSocket = client
-            };
-
-            // Begin receiving the data from the remote device.  
-            client.BeginReceive(state.buffer, 0, StateObject.BufferSize, 0,
-                new AsyncCallback(ReceiveCallback), state);
-        }
-
-        private static void ReceiveCallback(IAsyncResult ar)
-        {
-            // Retrieve the state object and the client socket   
-            // from the asynchronous state object.  
-            StateObject state = (StateObject)ar.AsyncState;
-            Socket client = state.workSocket;
-
-            if (!client.Connected)
-                return;
-
-            // Read data from the remote device.  
-            int bytesRead = client.EndReceive(ar);
-
-            // Log2("Client ReceiveCallback bytesRead=" + bytesRead);
-
-            if (bytesRead > 0) {
-                // There might be more data, so store the data received so far.  
-                // state.sb.Append(Encoding.ASCII.GetString(state.buffer, 0, bytesRead));
-                state.bReceived.Add(state.buffer.ToArray());
-
-                // Get the rest of the data.  
-                client.BeginReceive(state.buffer, 0, StateObject.BufferSize, 0,
-                    new AsyncCallback(ReceiveCallback), state);
-            } else {
-                // Signal that all bytes have been received.  
-                receiveDone.Set();
-            }
-
-            if (state.bReceived.Count > 0) {
-                for (int j = 0; j < state.bReceived.Count; j += 3) {
-                    byte[] bufInstance = state.bReceived[0];
-                    MsgHeader aHr = (MsgHeader)InterOp.ByteArrayToStruct(bufInstance, 0, typeof(MsgHeader));
-
-                    if (!bDisableLogging) 
-                        Log2("Client receive: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " " + bytesRead + 
-                        " clientCounter=" + aHr.clientCounter + " bitVector=" + Convert.ToString(aHr.bitVector, 2).PadLeft(8, '0') + 
-                        " serverCounter=" + aHr.serverCounter + " lMQ=" + lMQ.Count() + " lNQ=" + lNQ.Count());
-
-                    lSrvNos.Add(aHr.serverCounter);
-
-                    if (dCliTimeStamps.ContainsKey(aHr.clientCounter)) {
-
-                        long ms = dCliTimeStamps[aHr.clientCounter];
-                        lock (dCliTimeStamps)
-                            dCliTimeStamps.Remove(aHr.clientCounter);
-
-                        int iPing = Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - ms);
-                        avgPing = CheckPing(iPing);
-                    }
-                }
-                state.bReceived.Clear();
-            }
-
-        }
 
         public static void NetSendThread()
         {
@@ -911,16 +838,82 @@
                 while (lNQ.Count > 0) {
                     MsgHeader aHs = lNQ[0];
 
-                    byte[] bytesToSend = InterOp.StructToByteArray(aHs);
                     lNQ.RemoveAt(0);
 
+                    int clientCounter = aHs.clientCounter;
+
+                    int serverCounter;
+                    // the client stores a list of reference numbers sent by the server
+                    // when the client sends this back to the server, it removes it from the list as done
+                    if (lSrvNos.Count > 0)
+                    {
+                        serverCounter = lSrvNos[0];
+                        lock(lSrvNos)
+                            lSrvNos.RemoveAt(0);
+                    } else {
+                        serverCounter = 0;
+                        Log2("Client send: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " Warning: No Server counter found: " + iSizeMh +
+" clientCounter=" + clientCounter + " bitVector=" + Convert.ToString(aHs.bitVector, 2).PadLeft(16, '0') +
+" serverCounter=" + serverCounter + " lMQ=" + lMQ.Count() + " lNQ=" + lNQ.Count());
+                    }
+
+                    aHs.serverCounter = Convert.ToByte(serverCounter);
+
                     if (!bDisableLogging) 
-                        Log2("Client send: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " " + bytesToSend.Length + 
-                        " clientCounter=" + aHs.clientCounter + " bitVector=" + Convert.ToString(aHs.bitVector, 2).PadLeft(8, '0') + 
-                        " serverCounter=" + aHs.serverCounter + " lMQ=" + lMQ.Count() + " lNQ=" + lNQ.Count());
+                        Log2("Client send: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " " + iSizeMh + 
+                        " clientCounter=" + clientCounter + " bitVector=" + Convert.ToString(aHs.bitVector, 2).PadLeft(16, '0') + 
+                        " serverCounter=" + serverCounter + " lMQ=" + lMQ.Count() + " lNQ=" + lNQ.Count());
+
+                    byte[] bytesToSend = InterOp.StructToByteArray(aHs);
                     nwStream.Write(bytesToSend, 0, bytesToSend.Length);
 
-                    Receive(client.Client);
+                    //System.Console.WriteLine("client.ReceiveBufferSize={0}", client.ReceiveBufferSize);
+                   
+                    byte[] buffer = new byte[client.ReceiveBufferSize];
+
+                    //---read incoming stream--- which might contain multiple packets in one
+                    int bytesRead = nwStream.Read(buffer, 0, client.ReceiveBufferSize);
+
+                    // the read data may contain multiple msgHeader elements, we process all of them in this loop
+                    for (int j = 0; j < bytesRead; j += iSizeMh)
+                    {
+                        byte[] bufInstance = buffer.Skip(j).Take(iSizeMh).ToArray();
+                        MsgHeader aHr = (MsgHeader)InterOp.ByteArrayToStruct(bufInstance, 0, typeof(MsgHeader));
+
+                        clientCounter = aHr.clientCounter;
+                        serverCounter = aHr.serverCounter;
+                        short sBitvector = aHr.bitVector;
+
+                        if (sBitvector > 1)
+                        { // Rig instance will send a status back to the key, inform user about any problem
+                            System.Console.Write('!');
+                            Log2("Rig side reports problem: " + sBitvector);
+                        }
+
+                        if (!bDisableLogging)
+                            Log2("Client receive: " + Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - startTime) + " " + bytesRead +
+                            " clientCounter=" + clientCounter + " bitVector=" + Convert.ToString(aHr.bitVector, 2).PadLeft(16, '0') +
+                            " serverCounter=" + serverCounter + " lMQ=" + lMQ.Count() + " lNQ=" + lNQ.Count());
+
+                        lock(lSrvNos)    
+                            lSrvNos.Add(serverCounter);
+
+                        if (dCliTimeStamps.ContainsKey(clientCounter))
+                        {
+                            long ms = dCliTimeStamps[clientCounter];
+                            lock (dCliTimeStamps)
+                                dCliTimeStamps.Remove(clientCounter);
+
+                            int iPing = Convert.ToInt32(DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond - ms);
+                            if (iPing > 1000)
+                            {
+                                System.Console.Write('!');
+                                Log2("High ping, " + iPing);
+                            }
+
+                            avgPing = CheckPing(iPing);
+                        }
+                    }
                 }
 
                 long ms2 = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
@@ -936,11 +929,7 @@
         // we send a struct by adding it to the public list lMQ
         public static bool NetSend(MsgHeader msg)
         {
-            int iNQel = lNQ.Count;
-            if (iNQel > 10)
-                return false;
-            else
-                lock (lMQ)
+            lock (lMQ)
                     lMQ.Add(msg);
 
             return true;
@@ -955,61 +944,59 @@
 
             int iScanCount = 0;
             int iClientCount = 0;
-            byte bOnOffStates = 0;
+            short sOnOffStates = 0;
 
             while (_continue)
             {
+                
                 try
                 {
                     // query relevant pins on serial port
                     bool pin6 = _serialPort.DsrHolding;
                     bool pin8 = _serialPort.CtsHolding;
+                    long lMilliSecs = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond; 
 
                     if (bSideSwiper)
-                        pin6 |= pin8; // hack add the status of Pin8 for SideSwiper
+                        pin6 |= pin8; // add the status of Pin8 for SideSwiper
 
-                    // the designed protocol uses a byte to store 8 polls
+                    // the designed protocol uses a byte to store 16 polls
                     if (pin6)
-                        bOnOffStates |= (byte)(1 << iScanCount);
-
-                    long lMilliSecs = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
+                        sOnOffStates |= (short)(1 << iScanCount);
 
                     // when all bits of the byte are set, we send this over to the rig
-                    if (iScanCount == 7) {
+                    if (iScanCount == 15) {
+
+                        if ((lMQ.Count + lNQ.Count) > 5)
+                        {
+                            System.Console.Write('*'); // warn user if messages to send to the server queue up
+                            Log2("queues too large, lMQ=" + lMQ.Count + ", lNQ=" + lNQ.Count);
+                        }
 
                         // the implemented protocol uses one byte to store a reference created by the client
                         // in our case it has the size of a byte (0..255), the counter is reset to 0 when it hits the boundary
-                        // with the client refrence (0..255) the epoch time in ms is kept in a dictinoary,
+                        // with the client refrence byte (0..255) the epoch time in ms is kept in a dictinoary,
                         // the server will send the client reference unmodified back to the client, and the client can calculate a rounttrip time 
-                        
+
                         if (dCliTimeStamps.ContainsKey(iClientCount)) {
                             Log2("Warning: Client time stamp not cleared=" + iClientCount);
 
                             lock (dCliTimeStamps)
                                 dCliTimeStamps.Remove(iClientCount); 
                         }
+
                         lock (dCliTimeStamps)
                             dCliTimeStamps.Add(iClientCount, lMilliSecs);
 
                         MsgHeader mHs;
-
-                        mHs.bitVector = bOnOffStates;
-
-                        // the client stores a list of reference numbers sent by the server
-                        // when the client sends this back to the server, it removes it from the list as done
                         mHs.serverCounter = 0;
-
-                        if (lSrvNos.Count > 0) {
-                            mHs.serverCounter = Convert.ToByte(lSrvNos[0]);
-                            lSrvNos.RemoveAt(0);
-                        }
+                        mHs.bitVector = sOnOffStates;
 
                         mHs.clientCounter = Convert.ToByte(iClientCount);
 
                         // hand over the data stored in the msgHeader structure indirectly to the send thread
                         NetSend(mHs);
                         iScanCount = 0;
-                        bOnOffStates = 0;
+                        sOnOffStates = 0;
 
                         if (iClientCount == 255)
                             iClientCount = 0;
@@ -1026,15 +1013,16 @@
                         waveOut.Play();
 
                         Morse.ToOn();
-                    }
 
-                    // now capture the case where the last status of the key was down (1) and the new is up (0).
-                    if (!pin6 && pin6_last) {
+                    } else if (!pin6 && pin6_last) { // now capture the case where the last status of the key was down (1) and the new is up (0).
+                       
                         // stop the listening tone
                         waveOut.Stop();
 
                         Morse.ToOff();
-                    }
+                    } else if (!pin6)
+                        Morse.IsOff();
+
 
                     if (pin8 && !pin8_last) {
                         // needs to be implemented, implement keyer functionality 
@@ -1047,10 +1035,6 @@
 
                     pin6_last = pin6;
                     pin8_last = pin8;
-
-                    if (!pin6) 
-                        Morse.IsOff();
-
                 }
                 catch (TimeoutException) { }
 
